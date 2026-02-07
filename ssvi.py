@@ -15,10 +15,12 @@ from datetime import datetime, timezone
 
 TICKER = "NOC"
 RISK_FREE_RATE = 0.04
-STRIKE_LOW = 0.6
-STRIKE_HIGH = 1.25
+ITM_FACTOR = 0.6 #Factor for excluding deep In-The-Money Options
+OTM_FACTOR = 1.25 #Factor for excluding deep Out-The-Money Options
 SMOOTH_SIGMA = 1.5
 FORWARD_TOL = 0.05
+MIN_DAYS = 30
+MAX_DAYS = 365
 
 # ======================
 # BLACK–SCHOLES
@@ -55,7 +57,7 @@ def fit_ssvi(calls, puts, spot, T):
         for _, row in df.iterrows():
             K = row["strike"]
 
-            if K < STRIKE_LOW * spot or K > STRIKE_HIGH * spot:
+            if K < ITM_FACTOR * spot or K > OTM_FACTOR * spot:
                 continue
 
             iv = row["impliedVolatility"]
@@ -106,28 +108,29 @@ def fit_ssvi(calls, puts, spot, T):
 # LOAD DATA
 # ======================
 
-ticker = yf.Ticker(TICKER)
-spot = ticker.history(period="1d")["Close"].iloc[-1]
+ticker = yf.Ticker(TICKER) #Initialising ticker
+spot = ticker.history(period="1d")["Close"].iloc[-1] #Retrieving last closing price and using it as the stock price
 
-today = datetime.now(timezone.utc)
+today = pd.Timestamp.today().normalize() #Retrieving todays date and setting the clock to 00:00
 
 surface = []
 
 for exp in ticker.options:
-    exp_dt = datetime.strptime(exp, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    t = (exp_dt - today).days
-    T =  t / 365.0
 
-    if t <= 30 or t > 365:
+    t = (pd.to_datetime(exp)-today).days #Calculating the amount of days until expiry
+    
+    if t <= MIN_DAYS or t > MAX_DAYS:
+        continue
+    else:
+        T =  t / 365.0 #Turning the amount of days until expiry into years
+
+    opt = ticker.option_chain(exp) #Retrieving call and put options with strike equal chosen expiry
+    iv_func = fit_ssvi(opt.calls, opt.puts, spot, T) #Fitting SSVI
+
+    if iv_func is None: #Checking if fit_ssvi returned something
         continue
 
-    opt = ticker.option_chain(exp)
-    iv_func = fit_ssvi(opt.calls, opt.puts, spot, T)
-
-    if iv_func is None:
-        continue
-
-    K_grid = np.linspace(STRIKE_LOW * spot, STRIKE_HIGH * spot, 300)
+    K_grid = np.linspace(ITM_FACTOR * spot, OTM_FACTOR * spot, 300) #Creating the Strike grid
     iv_grid = iv_func(K_grid)
 
     call_prices = np.array([
@@ -135,17 +138,21 @@ for exp in ticker.options:
         for K, iv in zip(K_grid, iv_grid)
     ])
 
+    # ======================
+    # Breeden Litzenberger
+    # ======================
+
     dK = K_grid[1] - K_grid[0]
     d2C = np.gradient(np.gradient(call_prices, dK), dK)
     pdf = np.exp(RISK_FREE_RATE * T) * d2C
     pdf[pdf < 0] = 0
 
-    integral = np.trapezoid(pdf, K_grid)
+    integral = np.trapezoid(pdf, K_grid) 
     if integral <= 0:
         continue
 
-    pdf /= integral
-    pdf = gaussian_filter1d(pdf, SMOOTH_SIGMA)
+    pdf /= integral #Normalising
+    pdf = gaussian_filter1d(pdf, SMOOTH_SIGMA) #Using a gaussian filter for smoothing
 
     expected_forward = np.trapezoid(K_grid * pdf, K_grid)
     theoretical_forward = spot * np.exp(RISK_FREE_RATE * T)
